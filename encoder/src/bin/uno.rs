@@ -1,31 +1,83 @@
-/*!
- * Blink the builtin LED - the "Hello World" of embedded programming.
- */
 #![no_std]
 #![no_main]
+#![feature(abi_avr_interrupt)]
 
+use arduino_hal::prelude::*;
+use core::cell;
 use panic_halt as _;
 
-use arduino_uno::hal::port::mode::Output;
-use arduino_uno::hal::port::portb::PB5;
-use arduino_uno::prelude::*;
+use embedded_hal::serial::Read;
 
-fn stutter_blink(led: &mut PB5<Output>, times: usize) {
-    (0..times).map(|i| i * 10).for_each(|i| {
-        led.toggle().void_unwrap();
-        arduino_uno::delay_ms(i as u16);
+// Possible Values:
+//
+// ╔═══════════╦══════════════╦═══════════════════╗
+// ║ PRESCALER ║ TIMER_COUNTS ║ Overflow Interval ║
+// ╠═══════════╬══════════════╬═══════════════════╣
+// ║        64 ║          250 ║              1 ms ║
+// ║       256 ║          125 ║              2 ms ║
+// ║       256 ║          250 ║              4 ms ║
+// ║      1024 ║          125 ║              8 ms ║
+// ║      1024 ║          250 ║             16 ms ║
+// ╚═══════════╩══════════════╩═══════════════════╝
+const PRESCALER: u32 = 1024;
+const TIMER_COUNTS: u32 = 125;
+
+const MILLIS_INCREMENT: u32 = PRESCALER * TIMER_COUNTS / 16000;
+
+static MILLIS_COUNTER: avr_device::interrupt::Mutex<cell::Cell<u32>> =
+    avr_device::interrupt::Mutex::new(cell::Cell::new(0));
+
+fn millis_init(tc0: arduino_hal::pac::TC0) {
+    // Configure the timer for the above interval (in CTC mode)
+    // and enable its interrupt.
+    tc0.tccr0a.write(|w| w.wgm0().ctc());
+    tc0.ocr0a.write(|w| unsafe { w.bits(TIMER_COUNTS as u8) });
+    tc0.tccr0b.write(|w| match PRESCALER {
+        8 => w.cs0().prescale_8(),
+        64 => w.cs0().prescale_64(),
+        256 => w.cs0().prescale_256(),
+        1024 => w.cs0().prescale_1024(),
+        _ => panic!(),
+    });
+    tc0.timsk0.write(|w| w.ocie0a().set_bit());
+
+    // Reset the global millisecond counter
+    avr_device::interrupt::free(|cs| {
+        MILLIS_COUNTER.borrow(cs).set(0);
     });
 }
 
-#[arduino_uno::entry]
+#[avr_device::interrupt(atmega328p)]
+fn TIMER0_COMPA() {
+    avr_device::interrupt::free(|cs| {
+        let counter_cell = MILLIS_COUNTER.borrow(cs);
+        let counter = counter_cell.get();
+        counter_cell.set(counter + MILLIS_INCREMENT);
+    })
+}
+
+fn millis() -> u32 {
+    avr_device::interrupt::free(|cs| MILLIS_COUNTER.borrow(cs).get())
+}
+
+use panic_halt as _;
+
+#[arduino_hal::entry]
 fn main() -> ! {
-    let peripherals = arduino_uno::Peripherals::take().unwrap();
+    let dp = arduino_hal::Peripherals::take().unwrap();
+    let pins = arduino_hal::pins!(dp);
+    let mut serial = arduino_hal::default_serial!(dp, pins, 57600);
 
-    let mut pins = arduino_uno::Pins::new(peripherals.PORTB, peripherals.PORTC, peripherals.PORTD);
+    millis_init(dp.TC0);
 
-    let mut led = pins.d13.into_output(&mut pins.ddr);
+    // Enable interrupts globally
+    unsafe { avr_device::interrupt::enable() };
 
+    // Wait for a character and print current time once it is received
     loop {
-        stutter_blink(&mut led, 25);
+        let b = nb::block!(serial.read()).void_unwrap();
+
+        let time = millis();
+        ufmt::uwriteln!(&mut serial, "Got {} after {} ms!\r", b, time).void_unwrap();
     }
 }
